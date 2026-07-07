@@ -1,0 +1,118 @@
+x-airflow-common: &airflow-common
+  image: apache/airflow:3.3.0
+  environment: &airflow-common-env
+    AIRFLOW__CORE__EXECUTOR: LocalExecutor
+    AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://airflow:airflow@postgres/airflow
+    AIRFLOW__CORE__DAGS_FOLDER: /opt/airflow/dags
+    AIRFLOW__CORE__LOAD_EXAMPLES: "false"
+    # Host path of the project, needed for DockerOperator sibling-container mounts
+    HOST_PROJECT_DIR: ${HOST_PROJECT_DIR}
+    HOST_HF_CACHE_DIR: ${HOST_HF_CACHE_DIR}
+    NEBIUS_API_KEY: ${NEBIUS_API_KEY}
+    HF_TOKEN: ${HF_TOKEN}
+    MLFLOW_TRACKING_URI: http://mlflow:5000
+    # MinIO (S3-compatible) credentials for artifact upload
+    AWS_ACCESS_KEY_ID: ${MINIO_ROOT_USER:-minioadmin}
+    AWS_SECRET_ACCESS_KEY: ${MINIO_ROOT_PASSWORD:-minioadmin}
+    S3_ENDPOINT_URL: http://minio:9000
+    S3_BUCKET: ${S3_BUCKET:-mlops-runs}
+    _PIP_ADDITIONAL_REQUIREMENTS: apache-airflow-providers-docker mlflow boto3
+  volumes:
+    - ./dags:/opt/airflow/dags
+    - ./src:/opt/airflow/src
+    - ./runs:/opt/airflow/runs
+    - /var/run/docker.sock:/var/run/docker.sock
+  user: "${AIRFLOW_UID:-50000}:0"
+  group_add:
+    - "${DOCKER_GID:-999}"
+  depends_on:
+    postgres:
+      condition: service_healthy
+
+services:
+  postgres:
+    image: postgres:16
+    environment:
+      POSTGRES_USER: airflow
+      POSTGRES_PASSWORD: airflow
+      POSTGRES_DB: airflow
+    volumes:
+      - postgres-db:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD", "pg_isready", "-U", "airflow"]
+      interval: 10s
+      retries: 5
+
+  airflow-init:
+    <<: *airflow-common
+    entrypoint: /bin/bash
+    command:
+      - -c
+      - |
+        airflow db migrate
+        airflow users create \
+          --username admin --password admin \
+          --firstname Admin --lastname User \
+          --role Admin --email admin@example.com || true
+    restart: "no"
+
+  airflow:
+    <<: *airflow-common
+    command: standalone
+    ports:
+      - "8080:8080"
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+      airflow-init:
+        condition: service_completed_successfully
+
+  mlflow:
+    image: ghcr.io/mlflow/mlflow:latest
+    command: >
+      mlflow server
+      --backend-store-uri sqlite:///mlflow-data/mlflow.db
+      --artifacts-destination /mlflow-data/artifacts
+      --host 0.0.0.0
+      --port 5000
+    ports:
+      - "5000:5000"
+    volumes:
+      - mlflow-data:/mlflow-data
+    restart: unless-stopped
+
+  minio:
+    image: minio/minio:latest
+    command: server /data --console-address ":9001"
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER:-minioadmin}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD:-minioadmin}
+    ports:
+      - "9000:9000"
+      - "9001:9001"
+    volumes:
+      - minio-data:/data
+    healthcheck:
+      test: ["CMD", "mc", "ready", "local"]
+      interval: 10s
+      retries: 5
+    restart: unless-stopped
+
+  minio-init:
+    image: minio/mc:latest
+    depends_on:
+      minio:
+        condition: service_healthy
+    entrypoint: /bin/sh
+    command:
+      - -c
+      - |
+        mc alias set local http://minio:9000 ${MINIO_ROOT_USER:-minioadmin} ${MINIO_ROOT_PASSWORD:-minioadmin}
+        mc mb --ignore-existing local/${S3_BUCKET:-mlops-runs}
+    restart: "no"
+
+volumes:
+  postgres-db:
+  mlflow-data:
+  minio-data:
