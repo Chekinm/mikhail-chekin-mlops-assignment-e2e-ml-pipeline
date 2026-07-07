@@ -1,13 +1,13 @@
 """Configurable Airflow DAG for running mini-swe-agent and evaluating results.
 
-Pipeline: prepare_run -> run_agent -> run_eval -> summarize_and_log
+Pipeline: prepare_run -> run_agent -> run_eval -> upload_artifacts -> summarize_and_log
 Agent and eval steps run in isolated Docker containers via DockerOperator.
 """
 
 import json
 import os
 import sys
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 
 from airflow.decorators import dag, task
@@ -18,18 +18,29 @@ from docker.types import Mount
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(PROJECT_ROOT / "src"))
 
-from pipeline.helpers import (
+from pipeline.helpers import (  # noqa: E402
     RUNS_DIR,
     build_run_config,
     collect_metrics,
     log_mlflow_run,
     prepare_run_dir,
+    upload_run_to_s3,
     write_manifest,
 )
 
 DOCKER_IMAGE = "mlops-assignment:latest"
 CONTAINER_WORKDIR = "/mlops-assignment"
 CONTAINER_RUNS_DIR = f"{CONTAINER_WORKDIR}/runs"
+
+# Host-side paths for DockerOperator sibling containers.
+# When Airflow itself runs in a container, Mount sources must be HOST paths
+# (containers are created by the host Docker daemon), so we take them from
+# environment variables. Fallback to local paths for standalone mode.
+HOST_PROJECT_DIR = os.environ.get("HOST_PROJECT_DIR", str(PROJECT_ROOT))
+HOST_RUNS_DIR = f"{HOST_PROJECT_DIR}/runs"
+HOST_HF_CACHE_DIR = os.environ.get(
+    "HOST_HF_CACHE_DIR", str(Path.home() / ".cache" / "huggingface")
+)
 
 
 @dag(
@@ -65,7 +76,7 @@ CONTAINER_RUNS_DIR = f"{CONTAINER_WORKDIR}/runs"
 )
 def evaluate_agent():
 
-    @task
+    @task(retries=1, retry_delay=timedelta(minutes=1))
     def prepare_run(**context) -> dict:
         params = context["params"]
         run_config = build_run_config(params)
@@ -79,6 +90,11 @@ def evaluate_agent():
     model_tpl = "{{ ti.xcom_pull(task_ids='prepare_run')['model'] }}"
     slice_tpl = "{{ ti.xcom_pull(task_ids='prepare_run')['task_slice'] }}"
     workers_tpl = "{{ ti.xcom_pull(task_ids='prepare_run')['workers'] }}"
+    dataset_tpl = (
+        "{{ 'princeton-nlp/SWE-bench_Verified' "
+        "if ti.xcom_pull(task_ids='prepare_run')['subset'] == 'verified' "
+        "else 'princeton-nlp/SWE-bench_Lite' }}"
+    )
 
     common_docker_kwargs = dict(
         image=DOCKER_IMAGE,
@@ -92,13 +108,12 @@ def evaluate_agent():
                 type="bind",
             ),
             Mount(
-                source=str(RUNS_DIR),
+                source=HOST_RUNS_DIR,
                 target=CONTAINER_RUNS_DIR,
                 type="bind",
             ),
-            # add this mount to use cached model in sub docker containers.
             Mount(
-                source=str(Path.home() / ".cache" / "huggingface"),
+                source=HOST_HF_CACHE_DIR,
                 target="/root/.cache/huggingface",
                 type="bind",
             ),
@@ -110,6 +125,9 @@ def evaluate_agent():
             "MSWEA_COST_TRACKING": "ignore_errors",
         },
         working_dir=CONTAINER_WORKDIR,
+        retries=1,
+        retry_delay=timedelta(minutes=2),
+        execution_timeout=timedelta(hours=2),
     )
 
     run_agent = DockerOperator(
@@ -132,7 +150,7 @@ def evaluate_agent():
             "bash", "-c",
             (
                 "python -m swebench.harness.run_evaluation "
-                "--dataset_name princeton-nlp/SWE-bench_Verified "
+                f"--dataset_name {dataset_tpl} "
                 f"--predictions_path {CONTAINER_RUNS_DIR}/{run_id_tpl}/run-agent/preds.json "
                 f"--max_workers {workers_tpl} "
                 f"--run_id {run_id_tpl} "
@@ -145,22 +163,42 @@ def evaluate_agent():
         **common_docker_kwargs,
     )
 
-    @task
-    def summarize_and_log(run_config: dict) -> dict:
+    @task(
+        retries=2,
+        retry_delay=timedelta(minutes=1),
+        execution_timeout=timedelta(minutes=10),
+    )
+    def upload_artifacts(run_config: dict) -> str:
+        """Upload the run directory to S3-compatible object storage (MinIO)."""
+        run_dir = RUNS_DIR / run_config["run_id"]
+
+        bucket = os.environ.get("S3_BUCKET", "mlops-runs")
+        endpoint_url = os.environ.get("S3_ENDPOINT_URL", "http://localhost:9000")
+
+        return upload_run_to_s3(run_dir, bucket, endpoint_url)
+
+    @task(
+        retries=2,
+        retry_delay=timedelta(minutes=1),
+        execution_timeout=timedelta(minutes=10),
+    )
+    def summarize_and_log(run_config: dict, artifact_s3_uri: str) -> dict:
         run_dir = RUNS_DIR / run_config["run_id"]
         eval_dir = run_dir / "run-eval"
 
         metrics = collect_metrics(eval_dir)
         (run_dir / "metrics.json").write_text(json.dumps(metrics, indent=2))
 
-        write_manifest(run_config, run_dir)
-        log_mlflow_run(run_config, metrics, str(run_dir))
+        write_manifest(run_config, run_dir, artifact_s3_uri)
+        log_mlflow_run(run_config, metrics, str(run_dir), artifact_s3_uri)
 
         return {"run_id": run_config["run_id"], "metrics": metrics}
 
     # DAG wiring
     config = prepare_run()
-    config >> run_agent >> run_eval >> summarize_and_log(config)
+    s3_uri = upload_artifacts(config)
+    config >> run_agent >> run_eval >> s3_uri
+    summarize_and_log(config, s3_uri)
 
 
 evaluate_agent()

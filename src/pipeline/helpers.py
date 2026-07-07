@@ -2,6 +2,7 @@
 """
 
 import json
+import os
 from datetime import datetime
 from pathlib import Path
 from uuid import uuid4
@@ -59,7 +60,7 @@ def collect_metrics(eval_dir: Path) -> dict:
     }
 
 
-def write_manifest(run_config: dict, run_dir: Path) -> dict:
+def write_manifest(run_config: dict, run_dir: Path, artifact_s3_uri: str = "") -> dict:
     """Write manifest.json pointing to the important run artifacts."""
     manifest = {
         "run_id": run_config["run_id"],
@@ -70,16 +71,45 @@ def write_manifest(run_config: dict, run_dir: Path) -> dict:
         "eval_summary": "run-eval/summary.json",
         "metrics": "metrics.json",
         "artifact_uri": str(run_dir),
+        "artifact_s3_uri": artifact_s3_uri,
     }
     (run_dir / "manifest.json").write_text(json.dumps(manifest, indent=2))
     return manifest
 
 
-def log_mlflow_run(run_config: dict, metrics: dict, artifact_uri: str) -> None:
+def upload_run_to_s3(run_dir: Path, bucket: str, endpoint_url: str) -> str:
+    """Returns the S3 URI prefix where the artifacts were uploaded.
+    Credentials are read by boto3 from the standard AWS env vars
+    (AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY) — with MinIO these
+    hold the MinIO root user/password, and endpoint_url points to
+    the MinIO service instead of AWS."""
+    import boto3
+
+    s3 = boto3.client("s3", endpoint_url=endpoint_url)
+
+    run_id = run_dir.name
+    uploaded = 0
+
+    for file_path in sorted(run_dir.rglob("*")):
+        if not file_path.is_file():
+            continue
+        key = f"runs/{run_id}/{file_path.relative_to(run_dir)}"
+        s3.upload_file(str(file_path), bucket, key)
+        uploaded += 1
+
+    print(f"Uploaded {uploaded} files to s3://{bucket}/runs/{run_id}/")
+    return f"s3://{bucket}/runs/{run_id}/"
+
+
+def log_mlflow_run(
+    run_config: dict, metrics: dict, artifact_uri: str, artifact_s3_uri: str = ""
+) -> None:
     """Log parameters, metrics, and key artifacts to MLflow."""
     import mlflow
 
-    mlflow.set_tracking_uri(f"sqlite:///{PROJECT_ROOT / 'mlflow.db'}")
+    mlflow.set_tracking_uri(
+        os.environ.get("MLFLOW_TRACKING_URI", f"sqlite:///{PROJECT_ROOT / 'mlflow.db'}")
+    )
     mlflow.set_experiment("swe-bench-evaluation")
 
     with mlflow.start_run(run_name=run_config["run_id"]):
@@ -93,6 +123,9 @@ def log_mlflow_run(run_config: dict, metrics: dict, artifact_uri: str) -> None:
             "cost_limit": run_config["cost_limit"],
         })
         mlflow.log_metrics(metrics)
+
+        if artifact_s3_uri:
+            mlflow.set_tag("artifact_s3_uri", artifact_s3_uri)
 
         run_dir = Path(artifact_uri)
         for artifact_name in ["config.json", "metrics.json", "manifest.json"]:
