@@ -60,9 +60,6 @@ def run_agent_batch(run_config: dict, run_dir: Path) -> Path:
         "-o", str(agent_dir),
     ]
 
-    if run_config.get("cost_limit", 0) > 0:
-        cmd.extend(["--cost-limit", str(run_config["cost_limit"])])
-
     print(f"Running agent: {' '.join(cmd)}")
 
     result = subprocess.run(
@@ -120,7 +117,7 @@ def run_swebench_eval(run_config: dict, preds_path: Path, run_dir: Path) -> Path
 
     # swebench writes summary to: <model_slug>.<split>.json in CWD
     model_slug = run_config["model"].replace("/", "__")
-    summary_name = f"{model_slug}.{run_config['split']}.json"
+    summary_name = f"{model_slug}.{eval_run_id}.json"
     summary_src = PROJECT_ROOT / summary_name
     if summary_src.exists():
         shutil.copy2(summary_src, eval_dir / "summary.json")
@@ -153,7 +150,7 @@ def log_mlflow_run(run_config: dict, metrics: dict, artifact_uri: str) -> None:
     """Log parameters, metrics, and key artifacts to MLflow."""
     import mlflow
 
-    mlflow.set_tracking_uri(str(PROJECT_ROOT / "mlruns"))
+    mlflow.set_tracking_uri(f"sqlite:///{PROJECT_ROOT / 'mlflow.db'}")
     mlflow.set_experiment("swe-bench-evaluation")
 
     with mlflow.start_run(run_name=run_config["run_id"]):
@@ -175,4 +172,92 @@ def log_mlflow_run(run_config: dict, metrics: dict, artifact_uri: str) -> None:
                 mlflow.log_artifact(str(artifact_path))
 
 
+# DAG definition
 # ---------------------------------------------------------------------------
+
+@dag(
+    dag_id="evaluate_agent",
+    start_date=datetime(2024, 1, 1),
+    schedule=None,
+    catchup=False,
+    params={
+        "split": Param("test", type="string", description="SWE-bench split"),
+        "subset": Param("verified", type="string", description="SWE-bench subset"),
+        "workers": Param(5, type="integer", description="Number of parallel workers"),
+        "model": Param(
+            "nebius/moonshotai/Kimi-K2.6",
+            type="string",
+            description="LLM model identifier",
+        ),
+        "task_slice": Param(
+            "0:3",
+            type="string",
+            description="Slice of SWE-bench tasks (e.g. '0:3')",
+        ),
+        "run_id": Param(
+            "",
+            type="string",
+            description="Run ID (auto-generated if empty)",
+        ),
+        "cost_limit": Param(
+            0,
+            type="number",
+            description="Cost limit per instance (0 = unlimited)",
+        ),
+    },
+)
+def evaluate_agent():
+
+    @task
+    def prepare_run(**context) -> dict:
+        params = context["params"]
+        run_config = build_run_config(params)
+        prepare_run_dir(run_config)
+        return run_config
+
+    @task
+    def run_agent(run_config: dict) -> dict:
+        run_dir = RUNS_DIR / run_config["run_id"]
+        run_agent_batch(run_config, run_dir)
+        return run_config
+
+    @task
+    def run_eval(run_config: dict) -> dict:
+        run_dir = RUNS_DIR / run_config["run_id"]
+        preds_path = run_dir / "run-agent" / "preds.json"
+        run_swebench_eval(run_config, preds_path, run_dir)
+        return run_config
+
+    @task
+    def summarize_and_log(run_config: dict) -> dict:
+        run_dir = RUNS_DIR / run_config["run_id"]
+        eval_dir = run_dir / "run-eval"
+
+        metrics = collect_metrics(eval_dir)
+
+        (run_dir / "metrics.json").write_text(json.dumps(metrics, indent=2))
+
+        manifest = {
+            "run_id": run_config["run_id"],
+            "config": "config.json",
+            "predictions": "run-agent/preds.json",
+            "trajectories": "run-agent/",
+            "eval_logs": "run-eval/logs/",
+            "eval_summary": "run-eval/summary.json",
+            "metrics": "metrics.json",
+            "artifact_uri": str(run_dir),
+        }
+        (run_dir / "manifest.json").write_text(json.dumps(manifest, indent=2))
+
+        log_mlflow_run(run_config, metrics, str(run_dir))
+
+        return {"run_id": run_config["run_id"], "metrics": metrics}
+
+    # DAG wiring
+    config = prepare_run()
+    after_agent = run_agent(config)
+    after_eval = run_eval(after_agent)
+    summarize_and_log(after_eval)
+
+
+evaluate_agent()

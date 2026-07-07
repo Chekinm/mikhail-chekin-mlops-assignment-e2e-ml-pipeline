@@ -1,12 +1,23 @@
-__pycache__
-.ruff_cache
-.venv
+# Python
+__pycache__/
+*.pyc
+.venv/
+
+# Environment
 .env
 
-/trajectories/
-/trajectory.json
+# Run artifacts (generated, potentially large)
+runs/
+logs/
+trajectory.json
 
-/logs/
+# SWE-bench summary files written to project root
+*.test*.json
 
-mini-swe-agent/
-SWE-bench/
+# MLflow
+mlflow.db
+mlruns/
+
+# Airflow (home dir is ~/airflow, but just in case)
+airflow/
+*.log
