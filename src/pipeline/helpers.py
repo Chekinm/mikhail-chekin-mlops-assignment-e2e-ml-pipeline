@@ -6,6 +6,7 @@ import os
 from datetime import datetime
 from pathlib import Path
 from uuid import uuid4
+import yaml
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 RUNS_DIR = PROJECT_ROOT / "runs"
@@ -23,19 +24,33 @@ def build_run_config(params: dict) -> dict:
         "workers": params["workers"],
         "model": params["model"],
         "task_slice": params["task_slice"],
+        "step_limit": params["step_limit"],
         "cost_limit": params["cost_limit"],
         "created_at": datetime.utcnow().isoformat(),
     }
 
-
 def prepare_run_dir(run_config: dict) -> Path:
-    """Create the run directory tree and write config.json."""
+    """Create the run directory tree, write config.json and the agent
+    config override generated from Airflow params."""
     run_dir = RUNS_DIR / run_config["run_id"]
     run_dir.mkdir(parents=True, exist_ok=True)
     (run_dir / "run-agent").mkdir(exist_ok=True)
     (run_dir / "run-eval").mkdir(exist_ok=True)
 
     (run_dir / "config.json").write_text(json.dumps(run_config, indent=2))
+
+    # Agent config override: values controlled from Airflow params that
+    # have no CLI flag in `mini-extra swebench` (merged over the base
+    # config/swebench.yaml at runtime via a second --config spec).
+    agent_override = {
+        "agent": {
+            "step_limit": run_config["step_limit"],
+            "cost_limit": run_config["cost_limit"],
+        }
+    }
+    (run_dir / "agent_override.yaml").write_text(
+        yaml.safe_dump(agent_override, default_flow_style=False)
+    )
     return run_dir
 
 
@@ -57,6 +72,41 @@ def collect_metrics(eval_dir: Path) -> dict:
             if submitted > 0
             else 0.0
         ),
+    }
+    
+
+def collect_token_usage(agent_dir: Path) -> dict:
+    """Aggregate token usage from all trajectory files in run-agent/.
+
+    Each trajectory step records the raw litellm response, including
+    usage counters. Cost in dollars is unavailable (litellm has no
+    pricing for this model), but token counts are exact.
+    """
+    total_prompt = 0
+    total_completion = 0
+    total_api_calls = 0
+
+    for traj_path in agent_dir.rglob("*.traj.json"):
+        traj = json.loads(traj_path.read_text())
+
+        total_api_calls += (
+            traj.get("info", {}).get("model_stats", {}).get("api_calls", 0)
+        )
+
+        for message in traj.get("messages", []):
+            usage = (
+                message.get("extra", {})
+                .get("response", {})
+                .get("usage") or {}
+            )
+            total_prompt += usage.get("prompt_tokens", 0)
+            total_completion += usage.get("completion_tokens", 0)
+
+    return {
+        "total_prompt_tokens": total_prompt,
+        "total_completion_tokens": total_completion,
+        "total_tokens": total_prompt + total_completion,
+        "total_api_calls": total_api_calls,
     }
 
 

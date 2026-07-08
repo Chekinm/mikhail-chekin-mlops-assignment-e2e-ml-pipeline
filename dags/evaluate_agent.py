@@ -26,6 +26,7 @@ from pipeline.helpers import (  # noqa: E402
     prepare_run_dir,
     upload_run_to_s3,
     write_manifest,
+    collect_token_usage,
 )
 
 DOCKER_IMAGE = "mlops-assignment:latest"
@@ -67,8 +68,13 @@ HOST_HF_CACHE_DIR = os.environ.get(
             type="string",
             description="Run ID (auto-generated if empty)",
         ),
+        "step_limit": Param(
+            40, 
+            type="integer", 
+            description="Max agent steps per instance (cost control)",
+            ),
         "cost_limit": Param(
-            0,
+            0.5,
             type="number",
             description="Cost limit per instance (0 = unlimited)",
         ),
@@ -122,7 +128,6 @@ def evaluate_agent():
         environment={
             "NEBIUS_API_KEY": os.environ.get("NEBIUS_API_KEY", ""),
             "HF_TOKEN": os.environ.get("HF_TOKEN", ""),
-            "MSWEA_COST_TRACKING": "ignore_errors",
         },
         working_dir=CONTAINER_WORKDIR,
         retries=1,
@@ -134,6 +139,8 @@ def evaluate_agent():
         task_id="run_agent",
         command=[
             "mini-extra", "swebench",
+            "--config", f"{CONTAINER_WORKDIR}/config/swebench.yaml",
+            "--config", f"{CONTAINER_RUNS_DIR}/{run_id_tpl}/agent_override.yaml",
             "--subset", subset_tpl,
             "--split", split_tpl,
             "--model", model_tpl,
@@ -187,6 +194,7 @@ def evaluate_agent():
         eval_dir = run_dir / "run-eval"
 
         metrics = collect_metrics(eval_dir)
+        metrics.update(collect_token_usage(run_dir / "run-agent"))
         (run_dir / "metrics.json").write_text(json.dumps(metrics, indent=2))
 
         write_manifest(run_config, run_dir, artifact_s3_uri)

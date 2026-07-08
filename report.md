@@ -24,6 +24,7 @@ prepare_run -> run_agent -> run_eval -> upload_artifacts -> summarize_and_log
 | `summarize_and_log` | Python `@task` | Parses the eval summary into `metrics.json`, writes `manifest.json`, logs params/metrics/artifacts and the S3 URI to MLflow |
 
 ### Deployment (docker-compose)
+```
 docker-compose.yaml
 ├── postgres       Airflow metadata DB
 ├── airflow-init   one-shot DB migration
@@ -31,7 +32,7 @@ docker-compose.yaml
 ├── mlflow         MLflow tracking server (UI :5000)
 ├── minio          S3-compatible object storage (API :9000, console :9001)
 └── minio-init     one-shot bucket creation (mlops-runs)
-
+```
 ### Execution isolation (Docker-in-Docker via socket mount)
 
 `run_agent` and `run_eval` execute inside containers built from the project
@@ -80,7 +81,8 @@ Shared mounts for agent/eval containers:
 | `model` | `nebius/moonshotai/Kimi-K2.6` | LLM identifier (litellm format) |
 | `task_slice` | `0:3` | Slice of the dataset to run |
 | `run_id` | auto | Optional explicit run ID |
-| `cost_limit` | `0` | Recorded in config (batch CLI has no such option) |
+| `step_limit` | `40` | Max agent steps per instance (cost control, via agent_override.yaml) |
+| `cost_limit` | `0.5` | Max $ per instance; functional thanks to the custom litellm registry |
 
 ### Rerun / reproduce by run-id
 
@@ -95,20 +97,23 @@ allow post-hoc inspection without re-running.
 ## 3. Artifact layout
 
 Each run produces a self-contained directory:
-runs/<run-id>/
-config.json          # full run configuration + timestamp
-metrics.json         # parsed evaluation metrics
-manifest.json        # index of artifacts + local and S3 URIs
+
+```runs/<run-id>/
+config.json            # full run configuration + timestamp
+agent_override.yaml    # per-run agent config (step_limit, cost_limit)
+metrics.json           # parsed evaluation metrics + token usage
+manifest.json          # index of artifacts + local and S3 URIs
 run-agent/
-preds.json         # model patches, keyed by instance_id
-<instance_id>/     # one folder per instance
-*.traj.json      # full agent trajectory (steps, commands, outputs)
+preds.json           # model patches, keyed by instance_id
+<instance_id>/       # one folder per instance
+*.traj.json        # full agent trajectory (steps, commands, outputs)
 minisweagent.log
 run-eval/
-summary.json       # aggregate results (resolved/unresolved/errors)
+summary.json         # aggregate results (resolved/unresolved/errors)
 logs/<model>/<instance_id>/
-report.json      # per-instance test results (FAIL_TO_PASS etc.)
+report.json        # per-instance test results (FAIL_TO_PASS etc.)
 patch.diff, eval.sh, run_instance.log, test_output.txt
+```
 
 The same tree is uploaded to MinIO under `s3://mlops-runs/runs/<run-id>/`
 by the `upload_artifacts` task, and the URI is stored both in
@@ -118,22 +123,24 @@ by the `upload_artifacts` task, and the URI is stored both in
 upload (per the suggested `log-artifacts-to-s3 -> log-metrics-to-mlflow`
 ordering), so the S3 copy contains the raw run outputs; the final metrics
 live in MLflow and in the local folder.
-
----
-
-## 4. MLflow tracking
+markdown## 4. MLflow tracking
 
 Every run logs to the `swe-bench-evaluation` experiment on the MLflow
 server (http://localhost:5000):
 
-- **Params:** `run_id`, `model`, `split`, `subset`, `task_slice`, `workers`, `cost_limit`
-- **Metrics:** `total_instances`, `submitted_instances`, `completed_instances`,
-  `resolved_instances`, `unresolved_instances`, `error_instances`, `resolve_rate`
+- **Params:** `run_id`, `model`, `split`, `subset`, `task_slice`, `workers`,
+  `step_limit`, `cost_limit`
+- **Metrics:**
+  - evaluation: `total_instances`, `submitted_instances`,
+    `completed_instances`, `resolved_instances`, `unresolved_instances`,
+    `error_instances`, `resolve_rate`
+  - token usage (aggregated from trajectories): `total_prompt_tokens`,
+    `total_completion_tokens`, `total_tokens`, `total_api_calls`
 - **Tags:** `artifact_s3_uri` — pointer to the full artifact tree in MinIO
 - **Artifacts:** `config.json`, `metrics.json`, `manifest.json`
 
 Multiple runs can be compared side-by-side in the MLflow UI (e.g. different
-models or slices).
+models, slices, or step budgets).
 
 ![MLflow runs](screenshots/mlflow_runs.png)
 
@@ -141,19 +148,23 @@ models or slices).
 
 ## 5. Completed evaluation example
 
-[TODO: fill in after the compose run finishes]
-
-- Run ID: `[TODO]`
+Final evaluation with all fizes is 
+- Run ID: `test12`
 - Parameters: model `nebius/moonshotai/Kimi-K2.6`, subset `verified`,
-  split `test`, slice `[TODO]`, workers `[TODO]`
-- Result: `[TODO]` of `[TODO]` instances resolved (resolve_rate `[TODO]`)
-- Artifacts: `runs/[TODO]/` locally, `s3://mlops-runs/runs/[TODO]/` in MinIO
-- MLflow run: see screenshot above
+  split `test`, slice `0:3`, workers `5`, step_limit `40`, cost_limit `0.5`
+- Result: 1 of 3 submitted instances resolved (resolve_rate 0.33);
+  2 instances did not complete within the step/cost budget — an expected
+  trade-off of tight cost limits
+  Previouse runs without cost/iteration harness cost me more then 10USD overall. 
+  (You have to pay for the experience)
+- Token usage (from trajectories, logged to MLflow): 917,480 prompt +
+  83,160 completion = 1,000,640 total tokens across 97 API calls;
+  ≈ $1.20 at Nebius Token Factory prices ($0.95/1M in, $4.00/1M out)
+- Artifacts: `runs/test12/` locally, `s3://mlops-runs/runs/test12/` in MinIO
+- MLflow run: experiment `swe-bench-evaluation`, see screenshot
 
 ![Airflow DAG](screenshots/airflow_dag.png)
 ![Object storage artifacts](screenshots/object_storage_artifacts.png)
-
----
 
 ## 6. Engineering notes / problems encountered
 
@@ -190,15 +201,43 @@ Without a shared cache mount, every agent/eval container re-downloaded the
 SWE-bench dataset on start. Mounting the host HF cache removed the
 overhead.
 
+## Cost control
+
+The default mini-swe-agent config effectively has no working cost guard for
+this model: `cost_limit: 3.0` relies on litellm cost tracking, but litellm
+has no pricing entry for `nebius/moonshotai/Kimi-K2.6`, so with
+`MSWEA_COST_TRACKING=ignore_errors` every call is counted as $0.00 and the
+limit never triggers. Combined with `step_limit: 250`, a single looping
+instance consume millions of tokens.
+
+Fixes applied (three layers):
+
+1. **Real cost tracking.** A custom litellm model registry
+   (`config/litellm_registry.json`) provides input/output prices for the
+   model, so litellm computes real per-call costs and the agent's
+   `cost_limit` becomes functional. `MSWEA_COST_TRACKING=ignore_errors`
+   was removed — a missing pricing entry now fails loudly instead of
+   silently burning tokens.
+2. **Hard step budget.** The versioned agent config
+   (`config/swebench.yaml`) sets `step_limit: 40` (down from 250), and
+   both `step_limit` and `cost_limit` are exposed as Airflow params. They
+   are delivered to the agent via a generated per-run override file
+   (`runs/<run-id>/agent_override.yaml`, merged over the base config),
+   since the batch CLI has no flags for them.
+   This lead to falled tasks, due to reaching the limits. 
+3. **Post-hoc accounting.** `collect_token_usage()` aggregates exact
+   prompt/completion token counts and API call counts from all trajectory
+   files and logs them to MLflow alongside evaluation metrics, so the
+   token bill of every experiment is visible and comparable in the UI.
+
 ---
 
 ## 7. What could be improved
 
-- Build a custom Airflow image with mlflow/boto3/docker-provider baked in
-  instead of `_PIP_ADDITIONAL_REQUIREMENTS` (which reinstalls on every
-  container start and is dev-only).
-- Replace `DockerOperator` with `KubernetesPodOperator` for real
-  multi-node scale-out.
-- Push `mlops-assignment:latest` to a registry instead of relying on a
-  locally built image.
-- Structured metrics per instance (currently only aggregate counts).
+- Bake mlflow/boto3/docker-provider into a custom Airflow image instead of
+  installing them on every container start via `_PIP_ADDITIONAL_REQUIREMENTS`.
+- Push the task image to a registry instead of relying on a locally built one.
+- Log per-instance metrics (steps, tokens, resolved) in addition to
+  aggregate counts.
+
+- Some k8s staff, which I need to learn first:)
