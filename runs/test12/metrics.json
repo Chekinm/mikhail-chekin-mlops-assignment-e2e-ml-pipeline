@@ -1,0 +1,13 @@
+{
+  "total_instances": 500,
+  "submitted_instances": 3,
+  "completed_instances": 1,
+  "resolved_instances": 1,
+  "unresolved_instances": 0,
+  "error_instances": 0,
+  "resolve_rate": 0.3333333333333333,
+  "total_prompt_tokens": 917480,
+  "total_completion_tokens": 83160,
+  "total_tokens": 1000640,
+  "total_api_calls": 97
+}

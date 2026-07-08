@@ -1,0 +1,11 @@
+{
+  "run_id": "test12",
+  "config": "config.json",
+  "predictions": "run-agent/preds.json",
+  "trajectories": "run-agent/",
+  "eval_logs": "run-eval/logs/",
+  "eval_summary": "run-eval/summary.json",
+  "metrics": "metrics.json",
+  "artifact_uri": "/opt/airflow/runs/test12",
+  "artifact_s3_uri": "s3://mlops-runs/runs/test12/"
+}
