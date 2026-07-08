@@ -26,12 +26,12 @@ prepare_run -> run_agent -> run_eval -> upload_artifacts -> summarize_and_log
 ### Deployment (docker-compose)
 ```
 docker-compose.yaml
-├── postgres       Airflow metadata DB
-├── airflow-init   one-shot DB migration
-├── airflow        Airflow 3.3 standalone (UI :8080)
-├── mlflow         MLflow tracking server (UI :5000)
-├── minio          S3-compatible object storage (API :9000, console :9001)
-└── minio-init     one-shot bucket creation (mlops-runs)
+  ├── postgres       Airflow metadata DB
+  ├── airflow-init   one-shot DB migration
+  ├── airflow        Airflow 3.3 standalone (UI :8080)
+  ├── mlflow         MLflow tracking server (UI :5000)
+  ├── minio          S3-compatible object storage (API :9000, console :9001)
+  └── minio-init     one-shot bucket creation (mlops-runs)
 ```
 ### Execution isolation (Docker-in-Docker via socket mount)
 
@@ -99,20 +99,20 @@ allow post-hoc inspection without re-running.
 Each run produces a self-contained directory:
 
 ```runs/<run-id>/
-config.json            # full run configuration + timestamp
-agent_override.yaml    # per-run agent config (step_limit, cost_limit)
-metrics.json           # parsed evaluation metrics + token usage
-manifest.json          # index of artifacts + local and S3 URIs
-run-agent/
-preds.json           # model patches, keyed by instance_id
-<instance_id>/       # one folder per instance
-*.traj.json        # full agent trajectory (steps, commands, outputs)
-minisweagent.log
-run-eval/
-summary.json         # aggregate results (resolved/unresolved/errors)
-logs/<model>/<instance_id>/
-report.json        # per-instance test results (FAIL_TO_PASS etc.)
-patch.diff, eval.sh, run_instance.log, test_output.txt
+    config.json            # full run configuration + timestamp
+    agent_override.yaml    # per-run agent config (step_limit, cost_limit)
+    metrics.json           # parsed evaluation metrics + token usage
+    manifest.json          # index of artifacts + local and S3 URIs
+    run-agent/
+    preds.json           # model patches, keyed by instance_id
+    <instance_id>/       # one folder per instance
+    *.traj.json        # full agent trajectory (steps, commands, outputs)
+    minisweagent.log
+    run-eval/
+    summary.json         # aggregate results (resolved/unresolved/errors)
+    logs/<model>/<instance_id>/
+    report.json        # per-instance test results (FAIL_TO_PASS etc.)
+    patch.diff, eval.sh, run_instance.log, test_output.txt
 ```
 
 The same tree is uploaded to MinIO under `s3://mlops-runs/runs/<run-id>/`
@@ -123,7 +123,10 @@ by the `upload_artifacts` task, and the URI is stored both in
 upload (per the suggested `log-artifacts-to-s3 -> log-metrics-to-mlflow`
 ordering), so the S3 copy contains the raw run outputs; the final metrics
 live in MLflow and in the local folder.
-markdown## 4. MLflow tracking
+
+---
+
+## 4. MLflow tracking
 
 Every run logs to the `swe-bench-evaluation` experiment on the MLflow
 server (http://localhost:5000):
@@ -148,7 +151,7 @@ models, slices, or step budgets).
 
 ## 5. Completed evaluation example
 
-Final evaluation with all fizes is 
+Final evaluation with all fixes is 
 - Run ID: `test12`
 - Parameters: model `nebius/moonshotai/Kimi-K2.6`, subset `verified`,
   split `test`, slice `0:3`, workers `5`, step_limit `40`, cost_limit `0.5`
@@ -168,10 +171,10 @@ Final evaluation with all fizes is
 
 ## 6. Engineering notes / problems encountered
 
-### Airflow 3.3 specifics
-- The `mini-extra swebench` batch CLI has no `--cost-limit` option (only
-  `swebench-single` does) — the param is recorded in `config.json` but not
-  passed to the batch command.
+### СLI and tooling specifics
+- The `mini-extra swebench` batch CLI has no `--cost-limit` / `--step-limit`
+  options (only `swebench-single` has the former) — both are delivered via
+  a generated per-run config override (`agent_override.yaml`) instead.
 - SWE-bench harness writes its summary to `<model_slug>.<run_id>.json` in
   the CWD (not `<model_slug>.<split>.json`) — the eval task copies it into
   `runs/<run-id>/run-eval/summary.json`.
