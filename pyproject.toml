@@ -5,7 +5,9 @@ description = "Add your description here"
 readme = "README.md"
 requires-python = ">=3.12"
 dependencies = [
+    "boto3>=1.43.42",
     "mini-swe-agent>=2.4.1",
+    "mlflow>=3.14.0",
     "swebench>=4.1.0",
 ]
 

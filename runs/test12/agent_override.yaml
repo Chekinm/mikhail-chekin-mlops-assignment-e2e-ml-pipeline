@@ -1,0 +1,3 @@
+agent:
+  cost_limit: 0.5
+  step_limit: 40
